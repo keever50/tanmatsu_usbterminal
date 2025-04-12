@@ -1,131 +1,194 @@
+/******************************************************************************
+ * MIT License
+ * 
+ * Copyright (c) 2025 Kevin Witteveen (MartiniMarter)
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *****************************************************************************/
+
+
+/******************************************************************************
+ * Includes
+ *****************************************************************************/
+
 #include <stdio.h>
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
+#include "console.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_types.h"
 #include "esp_log.h"
+#include "freertos/idf_additions.h"
 #include "hal/lcd_types.h"
+#include "hal/usb_serial_jtag_hal.h"
 #include "nvs_flash.h"
 #include "pax_fonts.h"
 #include "pax_gfx.h"
 #include "pax_text.h"
+#include "console.h"
+#include "driver/usb_serial_jtag.h"
+#include "ezcmd2.h"
 
-// Constants
-static char const TAG[] = "main";
+/******************************************************************************
+ * Preprocessors
+ *****************************************************************************/
 
-// Global variables
-static esp_lcd_panel_handle_t       display_lcd_panel    = NULL;
-static esp_lcd_panel_io_handle_t    display_lcd_panel_io = NULL;
-static size_t                       display_h_res        = 0;
-static size_t                       display_v_res        = 0;
-static lcd_color_rgb_pixel_format_t display_color_format;
-static pax_buf_t                    fb                = {0};
-static QueueHandle_t                input_event_queue = NULL;
+#define ERRC ESP_ERROR_CHECK
+#define BUF_SIZE (1024*16)
 
-void blit(void) {
-    esp_lcd_panel_draw_bitmap(display_lcd_panel, 0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
+/******************************************************************************
+ * Globals
+ *****************************************************************************/
+
+static esp_lcd_panel_handle_t g_disp_lcd_panel = NULL;
+static size_t g_disp_h = 0;
+static size_t g_disp_v = 0;
+static lcd_color_rgb_pixel_format_t g_disp_color_format;
+static pax_buf_t g_pax_buf = {0};
+struct cons_insts_s g_con_insts;
+static FILE *g_stdout_f;
+char g_isb_buff[BUF_SIZE];
+static QueueHandle_t g_input_event_queue = NULL;
+
+
+/******************************************************************************
+ * Private Functions
+ *****************************************************************************/
+
+void cons_output(char *str, size_t len)
+{
+  usb_serial_jtag_write_bytes(str, len, 1000);
 }
 
-void app_main(void) {
-    // Start the GPIO interrupt service
-    gpio_install_isr_service(0);
+esp_err_t main_init_nvs()
+{
+  esp_err_t res = nvs_flash_init();
+  if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND)
+  {
+    ERRC(nvs_flash_erase());
+    res = nvs_flash_init();
+  }
 
-    // Initialize the Non Volatile Storage service
-    esp_err_t res = nvs_flash_init();
-    if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        res = nvs_flash_init();
+  return res;
+}
+
+void main_pax_init()
+{
+  pax_buf_init(&g_pax_buf, NULL,
+               g_disp_h, g_disp_v,
+               PAX_BUF_16_565RGB);
+  pax_buf_reversed(&g_pax_buf, false);
+  pax_buf_set_orientation(&g_pax_buf, PAX_O_ROT_CW);
+}
+
+void main_draw()
+{
+  const void *pixels = pax_buf_get_pixels(&g_pax_buf);
+
+  esp_lcd_panel_draw_bitmap(g_disp_lcd_panel,
+                            0, 0,
+                            g_disp_h,
+                            g_disp_v,
+                            pixels);
+}
+
+
+
+/* Entry point */
+
+void app_main( void )
+{
+  /* Initialization */
+
+  gpio_install_isr_service(0);
+  ERRC(main_init_nvs());         /* NVS */
+  ERRC(bsp_device_initialize()); /* BSP */
+
+  /* Get display device */
+
+  ERRC(bsp_display_get_panel(&g_disp_lcd_panel));
+
+  ERRC(bsp_display_get_parameters(&g_disp_h,
+                                  &g_disp_v,
+                                  &g_disp_color_format));
+
+  /* Graphics init */
+
+  main_pax_init();
+
+  /* Console init */
+
+  struct cons_config_s con_conf =
+  {
+    .font = pax_font_sky_mono,
+    .font_size_mult = 1,
+    .paxbuf = &g_pax_buf,
+    .output_cb = cons_output
+  };
+
+  console_init(&g_con_insts, &con_conf);
+  console_printf(&g_con_insts, "Init\n");
+  main_draw();
+
+  /* Input init */
+
+  ERRC(bsp_input_get_queue(&g_input_event_queue));
+  ERRC(bsp_input_set_backlight_brightness(100));
+
+  /* Input loop */
+
+  for (; ; )
+  {
+    bsp_input_event_t event;
+    int ret = xQueueReceive(g_input_event_queue, &event, pdMS_TO_TICKS(10));
+    if (ret == pdFALSE)
+    {
+      continue;
     }
-    ESP_ERROR_CHECK(res);
 
-    // Initialize the Board Support Package
-    ESP_ERROR_CHECK(bsp_device_initialize());
+    switch (event.type)
+    {
+      case INPUT_EVENT_TYPE_KEYBOARD:
+      {
+        char c = event.args_keyboard.ascii;
+        console_put(&g_con_insts, c);
+        main_draw();
+        break;
+      }
 
-    // Fetch the handle for using the screen, this works even when
-    res = bsp_display_get_panel(&display_lcd_panel);
-    ESP_ERROR_CHECK(res);                             // Check that the display handle has been initialized
-    bsp_display_get_panel_io(&display_lcd_panel_io);  // Do not check result of panel IO handle: not all types of
-                                                      // display expose a panel IO handle
-    res = bsp_display_get_parameters(&display_h_res, &display_v_res, &display_color_format);
-    ESP_ERROR_CHECK(res);  // Check that the display parameters have been initialized
+      case INPUT_EVENT_TYPE_NAVIGATION:
+      {
+        break;
+      }
 
-    ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
+      case INPUT_EVENT_TYPE_ACTION:
+      {
+        break;
+      }
 
-    // Initialize the graphics stack
-    pax_buf_init(&fb, NULL, display_h_res, display_v_res, PAX_BUF_16_565RGB);
-    pax_buf_reversed(&fb, false);
-    pax_buf_set_orientation(&fb, PAX_O_ROT_CW);
-
-    ESP_LOGW(TAG, "Hello world!");
-
-    pax_background(&fb, 0xFFFFFFFF);
-    pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Hello world!");
-    blit();
-
-    while (1) {
-        bsp_input_event_t event;
-        if (xQueueReceive(input_event_queue, &event, pdMS_TO_TICKS(10)) == pdTRUE) {
-            switch (event.type) {
-                case INPUT_EVENT_TYPE_KEYBOARD: {
-                    if (event.args_keyboard.ascii != '\b' ||
-                        event.args_keyboard.ascii != '\t') {  // Ignore backspace & tab keyboard events
-                        ESP_LOGI(TAG, "Keyboard event %c (%02x) %s", event.args_keyboard.ascii,
-                                 (uint8_t)event.args_keyboard.ascii, event.args_keyboard.utf8);
-                        pax_simple_rect(&fb, 0xFFFFFFFF, 0, 0, pax_buf_get_width(&fb), 72);
-                        pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Keyboard event");
-                        char text[64];
-                        snprintf(text, sizeof(text), "ASCII:     %c (0x%02x)", event.args_keyboard.ascii,
-                                 (uint8_t)event.args_keyboard.ascii);
-                        pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 18, text);
-                        snprintf(text, sizeof(text), "UTF-8:     %s", event.args_keyboard.utf8);
-                        pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 36, text);
-                        snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_keyboard.modifiers);
-                        pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 54, text);
-                        blit();
-                    }
-                    break;
-                }
-                case INPUT_EVENT_TYPE_NAVIGATION: {
-                    ESP_LOGI(TAG, "Navigation event %0" PRIX32 ": %s", (uint32_t)event.args_navigation.key,
-                             event.args_navigation.state ? "pressed" : "released");
-
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F1) {
-                        bsp_input_set_backlight_brightness(0);
-                    }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F2) {
-                        bsp_input_set_backlight_brightness(100);
-                    }
-
-                    pax_simple_rect(&fb, 0xFFFFFFFF, 0, 0, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Navigation event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Key:       0x%0" PRIX32, (uint32_t)event.args_navigation.key);
-                    pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 18, text);
-                    snprintf(text, sizeof(text), "State:     %s", event.args_navigation.state ? "pressed" : "released");
-                    pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 36, text);
-                    snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_navigation.modifiers);
-                    pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 54, text);
-                    blit();
-                    break;
-                }
-                case INPUT_EVENT_TYPE_ACTION: {
-                    ESP_LOGI(TAG, "Action event %0" PRIX32 ": %s", (uint32_t)event.args_action.type,
-                             event.args_action.state ? "yes" : "no");
-                    pax_simple_rect(&fb, 0xFFFFFFFF, 0, 0, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 0, "Action event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Type:      0x%0" PRIX32, (uint32_t)event.args_action.type);
-                    pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 36, text);
-                    snprintf(text, sizeof(text), "State:     %s", event.args_action.state ? "yes" : "no");
-                    pax_draw_text(&fb, 0xFF000000, pax_font_sky_mono, 16, 0, 54, text);
-                    blit();
-                    break;
-                }
-                default:
-                    break;
-            }
-        }
+      default:
+      {
+        break;
+      }
     }
+  }
 }

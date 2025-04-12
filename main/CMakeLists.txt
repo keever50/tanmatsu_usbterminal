@@ -1,6 +1,7 @@
 idf_component_register(
 	SRCS
 		"main.c"
+    "ezcmd2.c"
 	PRIV_REQUIRES
 		esp_lcd
 		fatfs
