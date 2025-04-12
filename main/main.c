@@ -54,6 +54,7 @@
 
 #define ERRC ESP_ERROR_CHECK
 #define BUF_SIZE (1024*16)
+#define LINE_BUF_SIZE 128
 
 /******************************************************************************
  * Globals
@@ -68,7 +69,7 @@ struct cons_insts_s g_con_insts;
 static FILE *g_stdout_f;
 char g_isb_buff[BUF_SIZE];
 static QueueHandle_t g_input_event_queue = NULL;
-
+char g_linebuffer[LINE_BUF_SIZE];
 
 /******************************************************************************
  * Private Functions
@@ -111,7 +112,93 @@ void main_draw()
                             pixels);
 }
 
+void main_onkey(struct ezcmd_inst_s *ez, char c)
+{
+  int ret = ezcmd_put(ez, c);
+  if (ret == 0) return;
 
+  /* When ezcmd returns 1, we got a command ready */
+
+  for(;;)
+  {
+    char* arg = ezcmd_iterate_arguments(ez);
+    if (arg == NULL) break;
+    console_printf(&g_con_insts, arg);
+    console_printf(&g_con_insts,"\n\r");
+  }
+  main_draw();
+
+  /* Reset and continue */
+
+  ezcmd_reset(ez);
+}
+
+void main_inputlogic()
+{
+  struct ezcmd_inst_s ez;
+  ezcmd_init(&ez, g_linebuffer, sizeof(g_linebuffer));
+
+  /* Input loop */
+
+  for (; ; )
+  {
+    bsp_input_event_t event;
+    int ret = xQueueReceive(g_input_event_queue, &event, pdMS_TO_TICKS(10));
+    if (ret == pdFALSE)
+    {
+      continue;
+    }
+
+    switch (event.type)
+    {
+      case INPUT_EVENT_TYPE_KEYBOARD:
+      {
+
+        char c = event.args_keyboard.ascii;
+        console_put(&g_con_insts, c);
+        if (c == '\b')
+        {
+          /* Replace character with space */
+
+          console_printf(&g_con_insts, " \b");
+        }
+        main_draw();
+        main_onkey(&ez, c);
+        break;
+      }
+
+      case INPUT_EVENT_TYPE_NAVIGATION:
+      {
+        bsp_input_navigation_key_t k = event.args_navigation.key;
+        bool s = event.args_navigation.state;
+        if (!s) break;
+
+        /* Handle return */
+
+        if (k == BSP_INPUT_NAVIGATION_KEY_RETURN)
+        {
+          console_printf(&g_con_insts, "\r\n");
+          main_draw();
+          main_onkey(&ez, '\r');
+          break;
+        }
+
+        break;
+      }
+
+      case INPUT_EVENT_TYPE_ACTION:
+      {
+        break;
+      }
+
+      default:
+      {
+        break;
+      }
+    }
+  }
+
+}
 
 /* Entry point */
 
@@ -154,41 +241,8 @@ void app_main( void )
   ERRC(bsp_input_get_queue(&g_input_event_queue));
   ERRC(bsp_input_set_backlight_brightness(100));
 
-  /* Input loop */
-
-  for (; ; )
+  for(;;)
   {
-    bsp_input_event_t event;
-    int ret = xQueueReceive(g_input_event_queue, &event, pdMS_TO_TICKS(10));
-    if (ret == pdFALSE)
-    {
-      continue;
-    }
-
-    switch (event.type)
-    {
-      case INPUT_EVENT_TYPE_KEYBOARD:
-      {
-        char c = event.args_keyboard.ascii;
-        console_put(&g_con_insts, c);
-        main_draw();
-        break;
-      }
-
-      case INPUT_EVENT_TYPE_NAVIGATION:
-      {
-        break;
-      }
-
-      case INPUT_EVENT_TYPE_ACTION:
-      {
-        break;
-      }
-
-      default:
-      {
-        break;
-      }
-    }
+    main_inputlogic();
   }
 }

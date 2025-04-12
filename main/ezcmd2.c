@@ -37,6 +37,19 @@ int ezcmd_add_char(struct ezcmd_inst_s *inst, char c)
   return 0;
 }
 
+void ezcmd_whitelines_to_nulls(struct ezcmd_inst_s *inst)
+{
+  // TODO quotes disable conversion
+  for (size_t i = 0; i < inst->buffersize; i++)
+  {
+    char c = inst->buffer[i];
+    if (c == ' ')
+    {
+      inst->buffer[i] = '\0';
+    }
+  }
+}
+
 /******************************************************************************
  * Public Functions
  *****************************************************************************/
@@ -67,6 +80,7 @@ int ezcmd_put(struct ezcmd_inst_s *inst, char c)
     case '\r':
     {
       inst->command_ready = 1;
+      ezcmd_whitelines_to_nulls(inst);
       return 1;
     }
 
@@ -112,14 +126,14 @@ char* ezcmd_iterate_arguments(struct ezcmd_inst_s *inst)
 
     /* Boundry. No more arguments. Return NULL */
 
-    if (inst->iterator_pos >= inst->buffersize)
+    if (inst->iterator_pos >= inst->cursor_pos)
     {
       return NULL;
     }
 
-    /* Arguments start after a white space */
+    /* Arguments start after nulls*/
 
-    if (c == ' ')
+    if (c == '\0')
     {
       /* We already incremented our position before,
        * so this is the first character of the argument
