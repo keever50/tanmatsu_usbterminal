@@ -61,6 +61,17 @@
 #define LINE_BUF_SIZE 128
 
 /******************************************************************************
+ * Types
+ *****************************************************************************/
+
+enum term_output_mode_e
+{
+  TERM_OUTPUT_CRLF = 0,
+  TERM_OUTPUT_CR = 1,
+  TERM_OUTPUT_LF = 2
+};
+
+/******************************************************************************
  * Globals
  *****************************************************************************/
 
@@ -77,10 +88,70 @@ char g_linebuffer[LINE_BUF_SIZE];
 
 unsigned long g_baudrate = 115200;
 bool g_usb_connected = false;
+enum term_output_mode_e g_term_output_mode = 0;
+int g_term_stopbits = 0;
+int g_term_parity = 0;
+int g_term_databits = 8;
 
 /******************************************************************************
  * Private Functions
  *****************************************************************************/
+
+char get_key()
+{
+  /* Get keyboard events from BSP */
+
+  bsp_input_event_t event;
+  int ret = xQueueReceive(g_input_event_queue, &event, pdMS_TO_TICKS(1));
+  if (ret == pdFALSE)
+  {
+    return 0;
+  }
+
+  switch (event.type)
+  {
+    /* Handle "normal" ASCII characters */
+
+    case INPUT_EVENT_TYPE_KEYBOARD:
+    {
+
+      char c = event.args_keyboard.ascii;
+      return c;
+    }
+
+    /* Handle special characters */
+
+    case INPUT_EVENT_TYPE_NAVIGATION:
+    {
+      bsp_input_navigation_key_t k = event.args_navigation.key;
+      bool s = event.args_navigation.state;
+      if (!s) break;
+
+      /* Handle return */
+
+      if (k == BSP_INPUT_NAVIGATION_KEY_RETURN)
+      {
+        return '\n';
+      }
+
+      /* Backspaces */
+
+      if (k == BSP_INPUT_NAVIGATION_KEY_BACKSPACE)
+      {
+        return '\b';
+      }
+
+      break;
+    }
+
+    default:
+    {
+      break;
+    }
+  }
+
+  return 0;
+}
 
 void cons_output(char *str, size_t len)
 {
@@ -210,9 +281,9 @@ void main_acmcdc()
     if (err != ESP_OK) continue;
     cdc_acm_line_coding_t line_coding;
     line_coding.dwDTERate = g_baudrate;
-    line_coding.bDataBits = 8;
-    line_coding.bParityType = 0;
-    line_coding.bCharFormat = 0;      
+    line_coding.bDataBits = g_term_databits;
+    line_coding.bParityType = g_term_parity;
+    line_coding.bCharFormat = g_term_stopbits;      
     err = cdc_acm_host_line_coding_set(cdc_dev, &line_coding);
     if (err != ESP_OK) continue;
     break;
@@ -220,10 +291,51 @@ void main_acmcdc()
 
   console_printf(&g_con_insts, "\nConnected\n"); main_draw();
 
+  /* Output loop */
+
   g_usb_connected = 1;
   while (g_usb_connected)
   {
-    vTaskDelay(100);
+    vTaskDelay(1);
+    char c = get_key();
+
+    /* Handle special chars */
+
+    /* Returns */
+
+    if (c == '\n')
+    {
+      switch (g_term_output_mode)
+      {
+        case TERM_OUTPUT_CRLF:
+        {
+          c = '\r';
+          cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)&c,1, 100);
+          c = '\n';
+          cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)&c,1, 100);
+          continue;
+        }
+
+        case TERM_OUTPUT_CR:
+        {
+          c = '\r';
+          cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)&c,1, 100);
+          continue;
+        }   
+        
+        case TERM_OUTPUT_LF:
+        {
+          c = '\n';
+          cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)&c,1, 100);
+          continue;
+        }        
+      }
+    }
+
+    if (c > 0)
+    {
+      cdc_acm_host_data_tx_blocking(cdc_dev, (uint8_t *)&c,1, 100);
+    }
   }
 
   console_printf(&g_con_insts, "\nStopped\n"); main_draw();
@@ -235,12 +347,62 @@ void main_acmcdc()
 
 /* Commands ******************************************************************/
 
-void main_cmd_help(struct ezcmd_inst_s *ez)
+void main_cmd_help()
 {
   console_printf(&g_con_insts, "help.           Shows this\n");
   console_printf(&g_con_insts, "baud {x}.       Sets the baudrate (default 115200)\n");
   console_printf(&g_con_insts, "start.          Opens the ACM-CDC terminal\n");
+  console_printf(&g_con_insts, "outmode {x}.    Sets the output line ending\n");
+  console_printf(&g_con_insts, "                0=CRLF, 1=CR, 2=LF\n");
+  console_printf(&g_con_insts, "parity {x}.     Sets serial parity\n");
+  console_printf(&g_con_insts, "                0=none, 1=odd, 2=even, 3=mark, 4=space\n");
+  console_printf(&g_con_insts, "bits {x}.       Sets serial data bits\n");
+  console_printf(&g_con_insts, "stopbits {x}.   Sets serial stop bits\n");
+  console_printf(&g_con_insts, "                0=1bit, 1=1.5bits, 2=2bits\n");
+
 }
+
+void main_cmd_stopbits(struct ezcmd_inst_s *ez)
+{
+  char *arg = ezcmd_iterate_arguments(ez);
+  if (arg == NULL) return;
+
+  int stops = strtoul(arg, NULL, 0);
+  g_term_stopbits = stops;
+  console_printf(&g_con_insts, "stopbits set to %d\n", g_term_stopbits);
+}
+
+void main_cmd_databits(struct ezcmd_inst_s *ez)
+{
+  char *arg = ezcmd_iterate_arguments(ez);
+  if (arg == NULL) return;
+
+  int databits = strtoul(arg, NULL, 0);
+  g_term_databits = databits;
+  console_printf(&g_con_insts, "databits set to %d\n", g_term_databits);
+}
+
+void main_cmd_parity(struct ezcmd_inst_s *ez)
+{
+  char *arg = ezcmd_iterate_arguments(ez);
+  if (arg == NULL) return;
+
+  int parity = strtoul(arg, NULL, 0);
+  g_term_parity = parity;
+  console_printf(&g_con_insts, "parity set to %d\n", g_term_parity);
+}
+
+
+void main_cmd_output_mode(struct ezcmd_inst_s *ez)
+{
+  char *arg = ezcmd_iterate_arguments(ez);
+  if (arg == NULL) return;
+
+  enum term_output_mode_e outmode = strtoul(arg, NULL, 0);
+  g_term_output_mode = outmode;
+  console_printf(&g_con_insts, "output set to %lu\n", g_term_output_mode);
+}
+
 
 void main_cmd_baud(struct ezcmd_inst_s *ez)
 {
@@ -265,7 +427,7 @@ void main_parse_cmd(struct ezcmd_inst_s *ez)
 
   if (!strcmp(cmd, "help"))
   {
-    main_cmd_help(ez);
+    main_cmd_help();
   }
   else if (!strcmp(cmd, "baud"))
   {
@@ -274,8 +436,30 @@ void main_parse_cmd(struct ezcmd_inst_s *ez)
   else if (!strcmp(cmd, "start"))
   {
     main_cmd_start(ez);
-  }  
+  }
+  else if(!strcmp(cmd, "parity"))
+  {
+    main_cmd_parity(ez);
+  }
+  else if(!strcmp(cmd, "stopbits"))
+  {
+    main_cmd_stopbits(ez);
+  }
+  else if(!strcmp(cmd, "bits"))
+  {
+    main_cmd_databits(ez);
+  }
+  else if(!strcmp(cmd, "outmode"))
+  {
+    main_cmd_output_mode(ez);
+  }
+  else{
+    console_printf(&g_con_insts, "Unknown command\n");
+  }
+
 }
+
+/* Handle key inputs */
 
 void main_onkey(struct ezcmd_inst_s *ez, char c)
 {
@@ -295,6 +479,7 @@ void main_onkey(struct ezcmd_inst_s *ez, char c)
   console_printf(&g_con_insts, ">");
 }
 
+
 void main_inputlogic()
 {
   struct ezcmd_inst_s ez;
@@ -305,6 +490,8 @@ void main_inputlogic()
   console_printf(&g_con_insts, ">");
   for (; ; )
   {
+    /* Get keyboard events from BSP */
+
     bsp_input_event_t event;
     int ret = xQueueReceive(g_input_event_queue, &event, pdMS_TO_TICKS(10));
     if (ret == pdFALSE)
@@ -324,7 +511,6 @@ void main_inputlogic()
 
           console_printf(&g_con_insts, "\b ");
         }
-        //main_draw();
         main_onkey(&ez, c);
         break;
       }
@@ -339,7 +525,6 @@ void main_inputlogic()
 
         if (k == BSP_INPUT_NAVIGATION_KEY_RETURN)
         {
-          //main_draw();
           console_printf(&g_con_insts, "\n");
           main_onkey(&ez, '\r');
           
@@ -424,7 +609,11 @@ void app_main( void )
   console_printf(&g_con_insts, "Installing CDC-ACM driver\n"); main_draw();
   ESP_ERROR_CHECK(cdc_acm_host_install(NULL));
 
-  
+  /* Show commands */
+
+  main_cmd_help();
+  main_draw();
+
   for(;;)
   {
     main_inputlogic();
